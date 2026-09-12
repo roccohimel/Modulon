@@ -2,6 +2,7 @@
 #include "codegen.h"
 #include "assembler.h"
 #include "i386.h"
+#include "jit.h"
 
 static void usage(void)
 {
@@ -9,6 +10,7 @@ static void usage(void)
 	       "  -o FILE          set output file\n"
 	       "  -S               emit generated x86-64 assembly text\n"
 	       "  -m32 -c          emit an ELF32 i386 relocatable object\n"
+	       "  --jit            compile and run in-process (JIT)\n"
 	       "  -ffreestanding   accepted for freestanding kernel builds\n"
 	       "  -lNAME           add a DT_NEEDED library to x86-64 output\n"
 	       "  --version        show version\n\n",
@@ -26,6 +28,8 @@ int main(int argc, char **argv)
 	bool compile_only = false;
 	bool target_i386 = false;
 	bool freestanding = false;
+	bool run_jit = false;
+	size_t first_source = 0;
 	for(index = 1; index < (size_t)argc; index++) {
 		if(!strcmp(argv[index], "--help") || !strcmp(argv[index], "-h")) {
 			usage();
@@ -45,6 +49,9 @@ int main(int argc, char **argv)
 		} else if(!strcmp(argv[index], "-c"))
 		{
 			compile_only = true;
+		} else if(!strcmp(argv[index], "--jit"))
+		{
+			run_jit = true;
 		} else if(!strcmp(argv[index], "-m32"))
 		{
 			target_i386 = true;
@@ -74,6 +81,8 @@ int main(int argc, char **argv)
 		{
 			fatal("unsupported option %s", argv[index]);
 		} else {
+			if(!nsrc)
+				first_source = index;
 			ARR_GROW(src, nsrc, csrc, char *);
 			src[nsrc++] = argv[index];
 		}
@@ -96,6 +105,14 @@ int main(int argc, char **argv)
 		parse_program(&tokens, &prog);
 	}
 	(void)freestanding;
+	if(run_jit && (compile_only || assembly_only || target_i386))
+		fatal("--jit cannot be combined with -S, -c, or -m32");
+	if(run_jit) {
+		JitModule *module = jit_compile(&prog, NULL, NULL);
+		int code = jit_run(module, "main", (int)(argc - first_source), &argv[first_source]);
+		jit_free(module);
+		return code;
+	}
 	if(compile_only) {
 		if(assembly_only)
 			fatal("-S and -c cannot be combined yet");
