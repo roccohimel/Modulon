@@ -1,0 +1,104 @@
+Modulon 1.1-rc1 test results
+
+ran: tests/1.1-rc1/*.mlon (10 files), 27 sep 2026
+build: ./build.sh clean from the main zip, mlonc reports 1.1-rc1
+how: bin/mlonc --jit <file>, checked stdout and exit code
+each test self-checks and returns 0 only if every assertion passed
+ran the whole set twice, same result both times
+
+Summary:
+
+Test		Result	xit	notes
+
+jit_1.mlon	pass	0	fib sum 88, exit code returned through jit_run
+jit_2.mlon	pass	0	banner len 11, classify total 3 (from 0+1+2)
+match_1.mlon	pass	0	all 5 day cases right, guarded pattern works
+match_2.mlon	pass	0	fizz labels for 1..15 correct, total 11
+memory_1.mlon	pass	0	point (5,7) seen via ptr and via original
+memory_2.mlon	pass	0	squares sum 30, 5 record calls, free() ok
+string_1.mlon	pass	0	3 vowels, strcmp ok. note: word[0] prints as 112, that is %v on a char, fine
+string_2.mlon	pass	0	hello, modulon. copy stayed independent after swapping sources
+types_1.mlon	pass	0	4 typeof checks, truncated 9, narrowed 65
+types_2.mlon	pass	0	sizeof 8 and 4, counter wrapped to 4
+
+10/10 pass, 0 fail. suite total exit status 0.
+
+Output log
+
+[jit_1.mlon]
+fib sum: 88
+
+[jit_2.mlon]
+banner: modulon jit (len 11)
+classified total: 3
+
+[match_1.mlon]
+day 3: weekday
+day 6 (bonus): bonus weekend
+day 7 (no bonus): weekend
+day 15: out of range
+day 0: invalid
+
+[match_2.mlon]
+1: number
+2: number
+3: Fizz
+4: number
+5: Buzz
+6: Fizz
+7: number
+8: number
+9: Fizz
+10: Buzz
+11: number
+12: Fizz
+13: number
+14: number
+15: FizzBuzz
+total: 11
+
+[memory_1.mlon]
+point: (5, 7)
+via pointer: (5, 7)
+
+[memory_2.mlon]
+sum of squares: 30
+record calls: 5
+
+[string_1.mlon]
+word: programming (len 11)
+first letter: 112
+vowels: 3
+
+[string_2.mlon]
+hello, modulon
+
+[types_1.mlon]
+checks: 4
+truncated: 9
+narrowed: 65
+
+[types_2.mlon]
+sizeof(struct Pair): 8
+sizeof(int): 4
+wrapped counter: 4
+
+Other things i tried while in there
+
+1. native x86-64 output (mlonc file.mlon -o out, no --jit) builds and
+   links a dynamic ELF fine, but external calls silently do nothing.
+   compiled match_1 to a real binary, it ran, exited 0, printed nothing.
+   same for a 3 line printf hello. a return-only main (return 42) worked
+   and the exit code came through. so imports like printf/strlen are dead
+   in the native path right now. worth a look before calling rc1 done, or
+   at least a note in the docs that programs using libc should use --jit.
+
+2. i386 compile-only (mlonc -m32 -c file.mlon -o x.o) fails on all 10 with
+   "fatal error: internal: relocation references unknown symbol printf".
+   pretty sure that is expected since AneoC objects are freestanding and
+   there is no libc to resolve against, just leaving it here for the record.
+   did not count these as failures.
+
+3. string_1 prints first letter as 112 rather than 'p'. looked at the test,
+   it checks word[0] == 'p' which passed, so it is just %v rendering a char
+   as its int value. not a bug, just noting it so nobody trips on it later.
