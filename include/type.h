@@ -24,6 +24,7 @@ typedef enum
 	TY_PTR,
 	TY_ARRAY,
 	TY_STRUCT,
+	TY_ENUM,
 	TY_XEVENT,
 	TY_VALIST,
 	TY_OPAQUE
@@ -37,6 +38,7 @@ typedef enum
 
 typedef struct CType CType;
 typedef struct StructMember StructMember;
+typedef struct { char *name; int32_t value; } EnumMember;
 struct StructMember
 {
 	char *name;
@@ -56,6 +58,9 @@ struct CType
 	long size;
 	long align;
 	bool packed;
+	EnumMember *enumerators;
+	size_t nenumerators, capenumerators;
+	bool enum_complete;
 };
 
 extern CType T_VOID;

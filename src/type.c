@@ -75,6 +75,7 @@ long type_size(CType *type)
 	case TY_SHORT:
 	case TY_U16:
 		return 2;
+	case TY_ENUM:
 	case TY_INT:
 	case TY_U32:
 	case TY_FLOAT:
@@ -113,7 +114,7 @@ long type_align(CType *type)
 		return 1;
 	if(type->kind == TY_SHORT || type->kind == TY_U16)
 		return 2;
-	if(type->kind == TY_INT || type->kind == TY_U32 || type->kind == TY_FLOAT)
+	if(type->kind == TY_ENUM || type->kind == TY_INT || type->kind == TY_U32 || type->kind == TY_FLOAT)
 		return 4;
 	if(type->kind == TY_LONG || type->kind == TY_ULONG)
 		return current_target == TARGET_I386 ? 4 : 8;
@@ -134,7 +135,7 @@ bool type_equal(CType *left, CType *right)
 		return false;
 	if(left->kind == TY_PTR || left->kind == TY_ARRAY)
 		return left->count == right->count && type_equal(left->base, right->base);
-	if(left->kind == TY_STRUCT)
+	if(left->kind == TY_STRUCT || left->kind == TY_ENUM)
 		return left == right;
 	return true;
 }

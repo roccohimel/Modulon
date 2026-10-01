@@ -1053,7 +1053,9 @@ static void patch_code(AsmImage *array, uint64_t text_va, uint64_t rodata_va, ui
 
 static void copy_into(uint8_t *file, uint64_t offset, const void *data, size_t size)
 {
-	memcpy(file + offset, data, size);
+    /* Empty sections may have no backing allocation. */
+    if(size)
+		memcpy(file + offset, data, size);
 }
 
 void write_independent_elf(const char *path, AsmImage *array, char **libraries, size_t library_count)

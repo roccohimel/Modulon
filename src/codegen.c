@@ -144,6 +144,7 @@ static CType *expr_type(Gen *generator, Expr *expression)
 	}
 	case EX_STR:
 		return ptr_to(&T_CHAR);
+	case EX_ENUM_CONST:
 	case EX_NUM:
 		return &T_U64;
 	case EX_UNARY:
@@ -248,7 +249,7 @@ static void load_rax(Gen *generator, CType *type)
 		emit(generator, "    movzx eax, byte ptr [rax]");
 	else if(type->kind == TY_SHORT || type->kind == TY_U16)
 		emit(generator, "    movzx eax, word ptr [rax]");
-	else if(type->kind == TY_INT)
+	else if((type->kind == TY_INT || type->kind == TY_ENUM))
 		emit(generator, "    movsxd rax, dword ptr [rax]");
 	else if(type->kind == TY_U32 || type->kind == TY_FLOAT)
 		emit(generator, "    mov eax, dword ptr [rax]");
@@ -262,7 +263,7 @@ static void store_rcx(Gen *generator, CType *type)
 		emit(generator, "    mov byte ptr [rcx], al");
 	else if(type->kind == TY_SHORT || type->kind == TY_U16)
 		emit(generator, "    mov word ptr [rcx], ax");
-	else if(type->kind == TY_INT || type->kind == TY_U32 || type->kind == TY_FLOAT)
+	else if((type->kind == TY_INT || type->kind == TY_ENUM) || type->kind == TY_U32 || type->kind == TY_FLOAT)
 		emit(generator, "    mov dword ptr [rcx], eax");
 	else
 		emit(generator, "    mov qword ptr [rcx], rax");
@@ -293,7 +294,7 @@ static void load_extern_global(Gen *generator, const char *name, CType *type)
 		emit(generator, "    movzx eax, byte ptr [rip+%s]", name);
 	else if(type->kind == TY_SHORT || type->kind == TY_U16)
 		emit(generator, "    movzx eax, word ptr [rip+%s]", name);
-	else if(type->kind == TY_INT)
+	else if((type->kind == TY_INT || type->kind == TY_ENUM))
 		emit(generator, "    movsxd rax, dword ptr [rip+%s]", name);
 	else if(type->kind == TY_U32 || type->kind == TY_FLOAT)
 		emit(generator, "    mov eax, dword ptr [rip+%s]", name);
@@ -572,6 +573,7 @@ static const char *variable_format(CType *type)
 	case TY_BOOL:
 	case TY_CHAR:
 	case TY_SHORT:
+	case TY_ENUM:
 	case TY_INT:
 	case TY_U8:
 	case TY_U16:
@@ -869,6 +871,7 @@ static void gen_expr(Gen *generator, Expr *expression)
 	char *lab;
 	Symbol s;
 	switch(expression->kind) {
+	case EX_ENUM_CONST:
 	case EX_NUM:
 		if(is_double_type(expression->type)) {
 			union
@@ -930,7 +933,7 @@ static void gen_expr(Gen *generator, Expr *expression)
 					emit(generator, "    movzx eax, al");
 				else if(expression->type->kind == TY_SHORT || expression->type->kind == TY_U16)
 					emit(generator, "    movzx eax, ax");
-				else if(expression->type->kind == TY_INT)
+				else if((expression->type->kind == TY_INT || expression->type->kind == TY_ENUM))
 					emit(generator, "    movsxd rax, eax");
 				else if(expression->type->kind == TY_U32)
 					emit(generator, "    mov eax, eax");
@@ -1225,7 +1228,16 @@ char *generate(Program *pointer)
 		declaration = pointer->a[index];
 		if(declaration->body || declaration->prototype || !declaration->init)
 			continue;
-		if(declaration->type->kind == TY_PTR && declaration->type->base &&
+        if(declaration->type->kind == TY_ENUM ||
+           (declaration->type->kind == TY_INT && declaration->init->kind == EX_ENUM_CONST)) {
+            long value;
+            if(!eval_const_expr(declaration->init,&value))
+                fatal("enum initializer for %s is not constant",declaration->name);
+            emit(&g,"    lea rax, [rip+%s]",declaration->name);
+            emit(&g,"    mov rcx, rax");
+            emit(&g,"    mov rax, %ld",value);
+            store_rcx(&g,declaration->type);
+        } else if(declaration->type->kind == TY_PTR && declaration->type->base &&
 			declaration->type->base->kind == TY_CHAR &&
 			declaration->init->kind == EX_STR) {
 			char *label = intern_string(&g, declaration->init->str);

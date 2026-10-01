@@ -70,3 +70,8 @@ String literals are stored in read-only memory, so their characters must not be 
 Copyright (c) 2026 The Modulon Software Foundation.
 Modulon C is licensed under the GNU General Public License, v3.
 For more information, please visit **https://mlonc.modulonsoftware.org/**
+## Enums
+
+C-style enums are supported in declarations and expressions, including explicit
+integer values, enum variables, and the JIT. See [enum support](ENUMS.md) for
+examples, semantics, and regression test commands.

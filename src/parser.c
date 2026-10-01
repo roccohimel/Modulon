@@ -55,12 +55,13 @@ static void sync_parser(Parser *parser)
 				break;
 			}
 		} else if(!strcmp(token->v, ";") &&
-			  paren_depth == 0 && bracket_depth == 0) {
+			  paren_depth == 0 && bracket_depth == 0 && brace_depth==0) {
 			position++;
 			break;
 		}
 		position++;
 	}
+	if(position<parser->ts->n && !strcmp(parser->ts->a[position].v,";")) position++;
 	if(position >= parser->ts->n)
 		position = parser->ts->n - 1;
 	parser->p = position;
@@ -113,6 +114,8 @@ static bool same_type(CType *array, CType *base_type)
 		return true;
 	if(!array || !base_type || array->kind != base_type->kind || array->count != base_type->count)
 		return false;
+	if(array->kind == TY_ENUM)
+		return array == base_type;
 	if(array->kind == TY_PTR || array->kind == TY_ARRAY)
 		return same_type(array->base, base_type->base);
 	return true;
@@ -136,10 +139,20 @@ static void add_alias(Parser *parser, char *name, CType *type)
 static CType *find_struct_tag(Program *prog, const char *name)
 {
 	size_t index;
-	for(index = 0; index < prog->ntags; index++)
-		if(!strcmp(prog->tags[index].name, name))
-			return prog->tags[index].type;
-	return NULL;
+    index=prog->ntags;
+    while(index--) {
+        if(prog->tags[index].active && !strcmp(prog->tags[index].name,name))
+            return prog->tags[index].type;
+    }
+    return NULL;
+}
+
+static int struct_tag_depth(Program *prog, const char *name)
+{
+    size_t i=prog->ntags;
+    while(i--) if(prog->tags[i].active && !strcmp(prog->tags[i].name,name))
+        return prog->tags[i].depth;
+    return -1;
 }
 
 static void add_struct_tag(Parser *parser, char *name, CType *type)
@@ -148,6 +161,7 @@ static void add_struct_tag(Parser *parser, char *name, CType *type)
 	if(!name || !*name)
 		return;
 	old = find_struct_tag(parser->prog, name);
+    if(struct_tag_depth(parser->prog,name)!=parser->scope_depth) old=NULL;
 	if(old && old != type)
 		perr(parser, "conflicting struct tag '%s'", name);
 	if(old)
@@ -155,6 +169,8 @@ static void add_struct_tag(Parser *parser, char *name, CType *type)
 	ARR_GROW(parser->prog->tags, parser->prog->ntags, parser->prog->captags, StructTag);
 	parser->prog->tags[parser->prog->ntags].name = name;
 	parser->prog->tags[parser->prog->ntags].type = type;
+    parser->prog->tags[parser->prog->ntags].depth=parser->scope_depth;
+    parser->prog->tags[parser->prog->ntags].active=true;
 	parser->prog->ntags++;
 }
 
@@ -189,7 +205,7 @@ static bool type_start(Parser *parser)
 	       !strcmp(character, "double") || !strcmp(character, "signed") ||
 	       !strcmp(character, "unsigned") || !strcmp(character, "const") ||
 	       !strcmp(character, "volatile") || !strcmp(character, "restrict") ||
-	       !strcmp(character, "struct") ||
+	       !strcmp(character, "struct") || !strcmp(character, "enum") ||
 	       !strcmp(character, "FILE") || !strcmp(character, "Display") ||
 	       !strcmp(character, "Window") || !strcmp(character, "GC") ||
 	       !strcmp(character, "Font") || !strcmp(character, "XEvent") ||
@@ -209,6 +225,183 @@ static bool type_start(Parser *parser)
 	       !strcmp(character, "int_fast32_t") || !strcmp(character, "int_fast64_t") ||
 	       !strcmp(character, "uint_fast8_t") || !strcmp(character, "uint_fast16_t") ||
 	       !strcmp(character, "uint_fast32_t") || !strcmp(character, "uint_fast64_t");
+}
+
+static Expr *parse_expr(Parser *parser, int minprec);
+
+/* Ordinary identifiers and enum tags have separate, lexical namespaces. */
+static NameBinding *find_binding(Parser *p, const char *name)
+{
+    size_t i = p->prog->nbindings;
+    while(i--) {
+        NameBinding *b = &p->prog->bindings[i];
+        if(b->active && !strcmp(b->name, name)) return b;
+    }
+    return NULL;
+}
+
+static void bind_name(Parser *p, char *name, CType *type, bool constant,
+                      long value, bool function)
+{
+    NameBinding *old = find_binding(p, name);
+    if(old && old->depth == p->scope_depth &&
+       (old->is_enum_constant || constant))
+        perr(p, "duplicate enum constant or conflicting identifier '%s'", name);
+    if(constant && find_alias(p->prog, name))
+        perr(p, "enum constant '%s' conflicts with typedef", name);
+    ARR_GROW(p->prog->bindings, p->prog->nbindings,
+             p->prog->capbindings, NameBinding);
+    p->prog->bindings[p->prog->nbindings++] = (NameBinding){
+        name, type, value, p->scope_depth, true, constant, function};
+}
+
+static void leave_scope(Parser *p)
+{
+    size_t i;
+    for(i=0; i<p->prog->nbindings; i++)
+        if(p->prog->bindings[i].depth == p->scope_depth)
+            p->prog->bindings[i].active = false;
+    for(i=0; i<p->prog->ntags; i++)
+        if(p->prog->tags[i].depth == p->scope_depth) p->prog->tags[i].active=false;
+    for(i=0; i<p->prog->nenum_tags; i++)
+        if(p->prog->enum_tags[i].depth == p->scope_depth)
+            p->prog->enum_tags[i].active = false;
+    p->scope_depth--;
+}
+
+static EnumTag *find_enum_tag(Parser *p, const char *name)
+{
+    size_t i=p->prog->nenum_tags;
+    while(i--) {
+        EnumTag *tag=&p->prog->enum_tags[i];
+        if(tag->active && !strcmp(tag->name,name)) return tag;
+    }
+    return NULL;
+}
+
+static bool reserved_enum_name(const char *name)
+{
+    static const char *words[]={"if","else","while","for","return","break",
+        "continue","switch","case","default","typedef","extern","static",
+        "inline","sizeof","typeof","match","var","do","goto","union","auto",
+        "register","_Alignof","_Alignas","_Static_assert","_Thread_local",
+        "_Noreturn","_Generic","_Atomic","_Complex","_Imaginary",NULL};
+    size_t i;
+    static const char *types[]={"int","char","short","long","float","double","void","enum","struct","bool","_Bool","string","signed","unsigned","const","volatile","restrict",NULL};
+    for(i=0;types[i];i++) if(!strcmp(name,types[i])) return true;
+    for(i=0; words[i]; i++) if(!strcmp(name,words[i])) return true;
+    return false;
+}
+
+static CType *parse_enum(Parser *p)
+{
+    char *name=NULL;
+    CType *type;
+    EnumTag *existing;
+    long next=0;
+    bool next_overflow=false;
+    if(ptok(p)->kind==TK_ID) name=pexpect_id(p,false);
+    existing=name ? find_enum_tag(p,name) : NULL;
+    if(!paccept(p,"{")) {
+        if(name && existing && struct_tag_depth(p->prog,name)>=existing->depth)
+            perr(p,"tag '%s' names a struct, not an enum",name);
+        if(!name || !existing || !existing->type->enum_complete)
+            perr(p,"unknown or incomplete enum tag '%s'",name ? name : "<missing>");
+        return existing->type;
+    }
+    if(name && reserved_enum_name(name)) perr(p,"invalid enum tag '%s'",name);
+    if(existing && existing->depth==p->scope_depth)
+        perr(p,"redefinition of enum '%s'",name);
+    if(name && struct_tag_depth(p->prog,name)==p->scope_depth)
+        perr(p,"enum tag '%s' conflicts with struct tag",name);
+    p->recovery_brace_depth++;
+    type=new_type(TY_ENUM,NULL,0,name ? name : "<anonymous enum>");
+    ARR_GROW(p->prog->enum_types,p->prog->nenum_types,p->prog->capenum_types,CType *);
+    p->prog->enum_types[p->prog->nenum_types++]=type;
+    if(name) {
+        ARR_GROW(p->prog->enum_tags,p->prog->nenum_tags,p->prog->capenum_tags,EnumTag);
+        p->prog->enum_tags[p->prog->nenum_tags++]=(EnumTag){name,type,p->scope_depth,true};
+    }
+    if(peq(p,"}")) perr(p,"enum declaration must contain at least one enumerator");
+    for(;;) {
+        char *member;
+        long value=next;
+        Expr *initializer;
+        if(ptok(p)->kind!=TK_ID)
+            perr(p,"expected enumerator name in enum declaration");
+        member=pexpect_id(p,false);
+        if(reserved_enum_name(member)) perr(p,"invalid enumerator name '%s'",member);
+        if(!peq(p,"=") && next_overflow)
+            perr(p,"implicit enum value for '%s' overflows signed 32-bit range",member);
+        if(paccept(p,"=")) {
+            initializer=parse_expr(p,2);
+            if(!eval_const_expr(initializer,&value))
+                perr(p,"enum value for '%s' must be a valid integer constant expression (check unknown names, division by zero, or invalid shifts)",member);
+        }
+        if(value<INT32_MIN || value>INT32_MAX)
+            perr(p,"enum value for '%s' is outside signed 32-bit range",member);
+        bind_name(p,member,&T_INT,true,value,false);
+        ARR_GROW(type->enumerators,type->nenumerators,type->capenumerators,EnumMember);
+        type->enumerators[type->nenumerators++]=(EnumMember){member,(int32_t)value};
+        next_overflow=value==INT32_MAX;
+        next=next_overflow ? 0 : value+1;
+        if(paccept(p,"}")) break;
+        if(!paccept(p,",")) perr(p,"expected ',' or '}' after enum enumerator '%s'",member);
+        if(paccept(p,"}")) break;
+    }
+    p->recovery_brace_depth--;
+    type->enum_complete=true;
+    p->enum_definition=true;
+    return type;
+}
+
+static CType *parsed_expr_type(Expr *e)
+{
+    CType *t;
+    if(!e) return NULL;
+    if(e->type) return e->type;
+    switch(e->kind) {
+    case EX_UNARY:
+        t=parsed_expr_type(e->left);
+        if(!strcmp(e->op,"&")) return t ? ptr_to(t) : NULL;
+        if(!strcmp(e->op,"*")) return t ? t->base : NULL;
+        return t;
+    case EX_BINARY: return parsed_expr_type(e->left);
+    case EX_INDEX:
+        t=parsed_expr_type(e->left); return t ? t->base : NULL;
+    case EX_MEMBER: case EX_PTRMEMBER: {
+        StructMember *m;
+        t=parsed_expr_type(e->left);
+        if(e->kind==EX_PTRMEMBER && t) t=t->base;
+        m=find_struct_member(t,e->str); return m ? m->type : NULL;
+    }
+    case EX_CALL: return parsed_expr_type(e->left);
+    default: return NULL;
+    }
+}
+
+static void check_enum_conversion(Parser *p, CType *target, Expr *value)
+{
+    CType *source;
+    size_t i;
+    if(!target || !value) return;
+    if(value->kind==EX_INITLIST && target->kind==TY_ARRAY) {
+        for(i=0;i<value->nargs;i++) check_enum_conversion(p,target->base,value->args[i]);
+        return;
+    }
+    if(target->kind!=TY_ENUM) return;
+    if(value->kind==EX_INITLIST)
+        perr(p,"enum object requires a scalar arithmetic initializer");
+    source=parsed_expr_type(value);
+    if(source && (source->kind==TY_PTR || source->kind==TY_ARRAY ||
+                  source->kind==TY_STRUCT || source->kind==TY_VOID))
+        perr(p,"enum object requires an arithmetic value, not a pointer or aggregate");
+}
+
+static void check_enum_lvalue(Parser *p, Expr *e)
+{
+    if(e && e->kind==EX_ENUM_CONST)
+        perr(p,"enum constant '%s' is not a writable or addressable lvalue",e->str);
 }
 
 static bool parse_gnu_attributes(Parser *parser)
@@ -263,17 +456,22 @@ static CType *parse_type(Parser *parser)
 	bool is_signed = false;
 	while(peq(parser, "const") || peq(parser, "volatile") || peq(parser, "restrict"))
 		parser->p++;
+	if(paccept(parser, "enum")) return parse_enum(parser);
 	if(paccept(parser, "struct")) {
 		char *tag = NULL;
 		CType *type;
 		if(ptok(parser)->kind == TK_ID && !peq(parser, "{"))
 			tag = pexpect_id(parser, false);
 		if(!paccept(parser, "{")) {
-			type = find_struct_tag(parser->prog, tag ? tag : "");
+			if(tag && find_enum_tag(parser,tag) && find_enum_tag(parser,tag)->depth>=struct_tag_depth(parser->prog,tag))
+                perr(parser,"tag '%s' names an enum, not a struct",tag);
+            type = find_struct_tag(parser->prog, tag ? tag : "");
 			if(!type)
 				perr(parser, "unknown struct '%s'", tag ? tag : "");
 			return type;
 		}
+		if(tag && find_enum_tag(parser,tag) && find_enum_tag(parser,tag)->depth==parser->scope_depth)
+			perr(parser,"struct tag conflicts with enum tag '%s'",tag);
 		type = new_type(TY_STRUCT, NULL, 0, tag ? tag : "<anonymous>");
 		add_struct_tag(parser, tag, type);
 		while(!paccept(parser, "}")) {
@@ -751,11 +949,22 @@ static Expr *parse_primary(Parser *parser)
 		return expression;
 	}
 	if(token->kind == TK_ID) {
-		parser->p++;
-		expression = new_expr(EX_ID);
-		expression->str = token->v;
-		return expression;
-	}
+        NameBinding *binding=find_binding(parser,token->v);
+        size_t i;
+        if(!binding) for(i=0;i<parser->prog->nbindings;i++) {
+            NameBinding *old=&parser->prog->bindings[i];
+            if(old->is_enum_constant && !strcmp(old->name,token->v))
+                perr(parser,"enum constant '%s' is outside its declaration scope",token->v);
+        }
+        parser->p++;
+        expression=new_expr(binding && binding->is_enum_constant ? EX_ENUM_CONST : EX_ID);
+        expression->str=token->v;
+        if(binding) {
+            expression->type=binding->type;
+            expression->num=(unsigned long long)binding->value;
+        }
+        return expression;
+    }
 	perr(parser, "expected expression");
 	return NULL;
 }
@@ -776,7 +985,20 @@ static Expr *parse_postfix(Parser *parser)
 						break;
 					pexpect(parser, ",");
 				}
-			expression = call_expression;
+			            if(call_expression->left->kind==EX_ID) {
+                Decl *function=NULL;
+                size_t i;
+                const char *name=call_expression->left->str;
+                if(parser->current_function && !strcmp(parser->current_function->name,name))
+                    function=parser->current_function;
+                for(i=0;!function && i<parser->prog->n;i++) {
+                    Decl *candidate=parser->prog->a[i];
+                    if((candidate->prototype || candidate->body) && !strcmp(candidate->name,name)) function=candidate;
+                }
+                if(function) for(i=0;i<function->nparams && i<call_expression->nargs;i++)
+                    check_enum_conversion(parser,function->params[i].type,call_expression->args[i]);
+            }
+            expression = call_expression;
 			continue;
 		}
 		if(paccept(parser, "[")) {
@@ -803,6 +1025,7 @@ static Expr *parse_postfix(Parser *parser)
 		}
 		if(paccept(parser, "++")) {
 			Expr *expression_2 = new_expr(EX_UNARY);
+			check_enum_lvalue(parser,expression);
 			expression_2->op = "post++";
 			expression_2->left = expression;
 			expression = expression_2;
@@ -810,6 +1033,7 @@ static Expr *parse_postfix(Parser *parser)
 		}
 		if(paccept(parser, "--")) {
 			Expr *expression_2 = new_expr(EX_UNARY);
+			check_enum_lvalue(parser,expression);
 			expression_2->op = "post--";
 			expression_2->left = expression;
 			expression = expression_2;
@@ -846,6 +1070,12 @@ static Expr *parse_unary(Parser *parser)
 		expression_1->op = ptok(parser)->v;
 		parser->p++;
 		expression_1->left = parse_unary(parser);
+        if(!strcmp(expression_1->op,"++") || !strcmp(expression_1->op,"--") || !strcmp(expression_1->op,"&"))
+            check_enum_lvalue(parser,expression_1->left);
+        if(strcmp(expression_1->op,"++") && strcmp(expression_1->op,"--") &&
+           strcmp(expression_1->op,"&") && strcmp(expression_1->op,"*") &&
+           parsed_expr_type(expression_1->left) && parsed_expr_type(expression_1->left)->kind==TY_ENUM)
+            expression_1->type=&T_INT;
 		return expression_1;
 	}
 	if(peq(parser, "!") || peq(parser, "~") || peq(parser, "-") || peq(parser, "+") || peq(parser, "&") || peq(parser, "*")) {
@@ -853,6 +1083,12 @@ static Expr *parse_unary(Parser *parser)
 		expression_1->op = ptok(parser)->v;
 		parser->p++;
 		expression_1->left = parse_unary(parser);
+        if(!strcmp(expression_1->op,"++") || !strcmp(expression_1->op,"--") || !strcmp(expression_1->op,"&"))
+            check_enum_lvalue(parser,expression_1->left);
+        if(strcmp(expression_1->op,"++") && strcmp(expression_1->op,"--") &&
+           strcmp(expression_1->op,"&") && strcmp(expression_1->op,"*") &&
+           parsed_expr_type(expression_1->left) && parsed_expr_type(expression_1->left)->kind==TY_ENUM)
+            expression_1->type=&T_INT;
 		return expression_1;
 	}
 	if(paccept(parser, "sizeof")) {
@@ -918,10 +1154,28 @@ static Expr *parse_expr(Parser *parser, int minprec)
 			 !strcmp(operator, "&=") || !strcmp(operator, "|=") || !strcmp(operator, "^=") ||
 			 !strcmp(operator, "<<=") || !strcmp(operator, ">>="));
 		rhs = parse_expr(parser, right ? precedence : precedence + 1);
+        if(right) { check_enum_lvalue(parser,lhs); check_enum_conversion(parser,parsed_expr_type(lhs),rhs); }
 		expression = new_expr(EX_BINARY);
 		expression->op = operator;
 		expression->left = lhs;
 		expression->right = rhs;
+        if(!right) {
+            CType *lt=parsed_expr_type(lhs), *rt=parsed_expr_type(rhs);
+            if((lt && lt->kind==TY_ENUM) || (rt && rt->kind==TY_ENUM)) {
+                if(precedence==2 || precedence==3 || precedence==7 || precedence==8)
+                    expression->type=&T_INT;
+                else if((lt && lt->kind==TY_DOUBLE) || (rt && rt->kind==TY_DOUBLE))
+                    expression->type=&T_DOUBLE;
+                else if((lt && (lt->kind==TY_PTR || lt->kind==TY_ARRAY)) ||
+                        (rt && (rt->kind==TY_PTR || rt->kind==TY_ARRAY))) {
+                    /* Leave pointer arithmetic typing to the existing backend. */
+                } else if(lt && lt->kind!=TY_ENUM && lt->kind!=TY_BOOL && lt->kind!=TY_CHAR && lt->kind!=TY_SHORT)
+                    expression->type=lt;
+                else if(rt && rt->kind!=TY_ENUM && rt->kind!=TY_BOOL && rt->kind!=TY_CHAR && rt->kind!=TY_SHORT)
+                    expression->type=rt;
+                else expression->type=&T_INT;
+            }
+        }
 		lhs = expression;
 	}
 	return lhs;
@@ -948,63 +1202,76 @@ static Expr *parse_initializer(Parser *parser)
 	return expression;
 }
 
+
 bool eval_const_expr(Expr *expression, long *value)
 {
-	long array, boundary;
-	if(!expression)
-		return false;
-	if(expression->kind == EX_NUM) {
-		*value = (long)expression->num;
-		return true;
-	}
-	if(expression->kind == EX_ID && !strcmp(expression->str, "NULL")) {
-		*value = 0;
-		return true;
-	}
-	if(expression->kind == EX_UNARY && eval_const_expr(expression->left, &array)) {
-		if(!strcmp(expression->op, "+") || !strcmp(expression->op, "cast"))
-			*value = array;
-		else if(!strcmp(expression->op, "-"))
-			*value = -array;
-		else if(!strcmp(expression->op, "~"))
-			*value = ~array;
-		else if(!strcmp(expression->op, "!"))
-			*value = !array;
-		else
-			return false;
-		return true;
-	}
-	if(expression->kind != EX_BINARY || !eval_const_expr(expression->left, &array) ||
-	   !eval_const_expr(expression->right, &boundary))
-		return false;
-	if(!strcmp(expression->op, "+"))
-		*value = array + boundary;
-	else if(!strcmp(expression->op, "-"))
-		*value = array - boundary;
-	else if(!strcmp(expression->op, "*"))
-		*value = array * boundary;
-	else if(!strcmp(expression->op, "/")) {
-		if(!boundary)
-			return false;
-		*value = array / boundary;
-	} else if(!strcmp(expression->op, "%"))
-	{
-		if(!boundary)
-			return false;
-		*value = array % boundary;
-	} else if(!strcmp(expression->op, "<<"))
-		*value = array << boundary;
-	else if(!strcmp(expression->op, ">>"))
-		*value = array >> boundary;
-	else if(!strcmp(expression->op, "&"))
-		*value = array & boundary;
-	else if(!strcmp(expression->op, "|"))
-		*value = array | boundary;
-	else if(!strcmp(expression->op, "^"))
-		*value = array ^ boundary;
-	else
-		return false;
-	return true;
+    long a,b;
+    const char *op;
+    if(!expression) return false;
+    if(expression->kind==EX_ENUM_CONST || expression->kind==EX_NUM) {
+        if(expression->type && (expression->type->kind==TY_DOUBLE || expression->type->kind==TY_FLOAT || expression->type->kind==TY_LDOUBLE)) return false;
+        if(expression->kind==EX_NUM && expression->num>LONG_MAX) return false;
+        *value=(long)expression->num; return true;
+    }
+    if(expression->kind==EX_SIZEOF) {
+        CType *type=expression->sizeof_type ? expression->sizeof_type : parsed_expr_type(expression->left);
+        if(!type || is_vla(type)) return false;
+        *value=type_size(type); return true;
+    }
+    if(expression->kind==EX_ID && !strcmp(expression->str,"NULL")) { *value=0; return true; }
+    if(expression->kind==EX_UNARY) {
+        if(!eval_const_expr(expression->left,&a)) return false;
+        op=expression->op;
+        if(!strcmp(op,"+")) *value=a;
+        else if(!strcmp(op,"cast")) {
+            CType *t=expression->type;
+            if(!t || t->kind==TY_PTR || t->kind==TY_DOUBLE || t->kind==TY_FLOAT || t->kind==TY_LDOUBLE || t->kind==TY_VOID || t->kind==TY_STRUCT) return false;
+            switch(t->kind) {
+            case TY_ENUM: case TY_INT: *value=(int32_t)a; break;
+            case TY_U32: *value=(uint32_t)a; break;
+            case TY_CHAR: *value=(int8_t)a; break;
+            case TY_U8: *value=(uint8_t)a; break;
+            case TY_SHORT: *value=(int16_t)a; break;
+            case TY_U16: *value=(uint16_t)a; break;
+            case TY_BOOL: *value=!!a; break;
+            default: *value=a; break;
+            }
+        } else if(!strcmp(op,"-")) { if(a==LONG_MIN) return false; *value=-a; }
+        else if(!strcmp(op,"~")) *value=~a;
+        else if(!strcmp(op,"!")) *value=!a;
+        else return false;
+        return true;
+    }
+    if(expression->kind!=EX_BINARY || !eval_const_expr(expression->left,&a)) return false;
+    op=expression->op;
+    if(!strcmp(op,"&&") && !a) { *value=0; return true; }
+    if(!strcmp(op,"||") && a) { *value=1; return true; }
+    if(!eval_const_expr(expression->right,&b)) return false;
+    if(!strcmp(op,"+")) return !__builtin_add_overflow(a,b,value);
+    if(!strcmp(op,"-")) return !__builtin_sub_overflow(a,b,value);
+    if(!strcmp(op,"*")) return !__builtin_mul_overflow(a,b,value);
+    if(!strcmp(op,"/") || !strcmp(op,"%")) {
+        if(!b || (a==LONG_MIN && b==-1)) return false;
+        *value=!strcmp(op,"/") ? a/b : a%b;
+    } else if(!strcmp(op,"<<")) {
+        if(b<0 || b>=(long)(sizeof(long)*CHAR_BIT) || a<0 || a>(LONG_MAX>>b)) return false;
+        *value=a<<b;
+    } else if(!strcmp(op,">>")) {
+        if(b<0 || b>=(long)(sizeof(long)*CHAR_BIT)) return false;
+        *value=a>>b;
+    } else if(!strcmp(op,"&")) *value=a&b;
+    else if(!strcmp(op,"|")) *value=a|b;
+    else if(!strcmp(op,"^")) *value=a^b;
+    else if(!strcmp(op,"==")) *value=a==b;
+    else if(!strcmp(op,"!=")) *value=a!=b;
+    else if(!strcmp(op,"<")) *value=a<b;
+    else if(!strcmp(op,"<=")) *value=a<=b;
+    else if(!strcmp(op,">")) *value=a>b;
+    else if(!strcmp(op,">=")) *value=a>=b;
+    else if(!strcmp(op,"&&")) *value=!!a && !!b;
+    else if(!strcmp(op,"||")) *value=!!a || !!b;
+    else return false;
+    return true;
 }
 
 static void infer_array_bound(Parser *parser, CType *type, Expr *initializer)
@@ -1027,6 +1294,16 @@ static Stmt *parse_block(Parser *parser)
 {
 	Stmt *statement = new_stmt(ST_BLOCK);
 	pexpect(parser, "{");
+    parser->scope_depth++;
+    if(parser->pending_params) {
+        size_t i;
+        for(i=0;i<parser->npending_params;i++) {
+            Param *param=&parser->pending_params[i];
+            bind_name(parser,param->name,param->type,false,0,false);
+        }
+        parser->pending_params=NULL;
+        parser->npending_params=0;
+    }
 	parser->recovery_brace_depth++;
 	while(!paccept(parser, "}")) {
 		Stmt *statement_1;
@@ -1037,6 +1314,7 @@ static Stmt *parse_block(Parser *parser)
 				perr(parser, "var declaration requires an initializer");
 			declaration->init = parse_initializer(parser);
 			declaration->is_var = true;
+            bind_name(parser,declaration->name,parsed_expr_type(declaration->init),false,0,false);
 			statement_1 = new_stmt(ST_DECL);
 			statement_1->decl = declaration;
 			ARR_GROW(statement->children, statement->nchildren, statement->capchildren, Stmt *);
@@ -1045,17 +1323,23 @@ static Stmt *parse_block(Parser *parser)
 			continue;
 		}
 		if(type_start(parser)) {
-			CType *base_type = parse_type(parser);
-			for(;;) {
+			CType *base_type;
+            parser->enum_definition=false;
+            base_type=parse_type(parser);
+            if(base_type->kind==TY_ENUM && parser->enum_definition &&
+               (paccept(parser,";") || type_start(parser) || reserved_enum_name(ptok(parser)->v) || peq(parser,"}"))) continue;
+            for(;;) {
 				Declarator q = parse_declarator(parser, base_type, false);
 				Decl *declaration = new_decl();
 				if(q.function)
 					perr(parser, "nested function unsupported");
 				declaration->name = q.name;
 				declaration->type = q.type;
+                bind_name(parser,q.name,q.type,false,0,false);
 				if(paccept(parser, "="))
 					declaration->init = parse_initializer(parser);
-				infer_array_bound(parser, declaration->type, declaration->init);
+				check_enum_conversion(parser,declaration->type,declaration->init);
+                infer_array_bound(parser, declaration->type, declaration->init);
 				statement_1 = new_stmt(ST_DECL);
 				statement_1->decl = declaration;
 				ARR_GROW(statement->children, statement->nchildren, statement->capchildren, Stmt *);
@@ -1071,6 +1355,7 @@ static Stmt *parse_block(Parser *parser)
 		statement->children[statement->nchildren++] = statement_1;
 	}
 	parser->recovery_brace_depth--;
+    leave_scope(parser);
 	return statement;
 }
 
@@ -1098,6 +1383,7 @@ static Stmt *parse_stmt(Parser *parser)
 		return statement;
 	}
 	if(paccept(parser, "for")) {
+        parser->scope_depth++;
 		statement = new_stmt(ST_FOR);
 		pexpect(parser, "(");
 		if(!paccept(parser, ";")) {
@@ -1108,6 +1394,7 @@ static Stmt *parse_stmt(Parser *parser)
 					perr(parser, "var declaration requires an initializer");
 				declaration->init = parse_initializer(parser);
 				declaration->is_var = true;
+            bind_name(parser,declaration->name,parsed_expr_type(declaration->init),false,0,false);
 				pexpect(parser, ";");
 				statement->init = new_stmt(ST_DECL);
 				statement->init->decl = declaration;
@@ -1119,9 +1406,11 @@ static Stmt *parse_stmt(Parser *parser)
 					perr(parser, "function declaration in for initializer unsupported");
 				declaration->name = q.name;
 				declaration->type = q.type;
+                bind_name(parser,q.name,q.type,false,0,false);
 				if(paccept(parser, "="))
 					declaration->init = parse_initializer(parser);
-				infer_array_bound(parser, declaration->type, declaration->init);
+				check_enum_conversion(parser,declaration->type,declaration->init);
+                infer_array_bound(parser, declaration->type, declaration->init);
 				pexpect(parser, ";");
 				statement->init = new_stmt(ST_DECL);
 				statement->init->decl = declaration;
@@ -1140,6 +1429,7 @@ static Stmt *parse_stmt(Parser *parser)
 			pexpect(parser, ")");
 		}
 		statement->body = parse_stmt(parser);
+        leave_scope(parser);
 		return statement;
 	}
 	if(paccept(parser, "match")) {
@@ -1178,6 +1468,8 @@ static Stmt *parse_stmt(Parser *parser)
 		statement = new_stmt(ST_RETURN);
 		if(!paccept(parser, ";")) {
 			statement->expr = parse_expr(parser, 1);
+            if(parser->current_function)
+                check_enum_conversion(parser,parser->current_function->type,statement->expr);
 			pexpect(parser, ";");
 		}
 		return statement;
@@ -1255,6 +1547,8 @@ void parse_program(Tokens *token_stream, Program *prog)
 	while(ptok(&p)->kind != TK_EOF) {
 		if(setjmp(p.error_jmp)) {
 			sync_parser(&p);
+            while(p.scope_depth>0) leave_scope(&p);
+            p.pending_params=NULL; p.npending_params=0; p.current_function=NULL;
 			continue;
 		}
 		bool is_typedef = false;
@@ -1295,7 +1589,10 @@ void parse_program(Tokens *token_stream, Program *prog)
 			perr(&p, "declaration cannot be both extern and static");
 		if(is_typedef && (is_extern || is_static || is_inline))
 			perr(&p, "typedef cannot be combined with extern, static, or inline");
-		base_type = parse_type(&p);
+		p.enum_definition=false;
+        base_type = parse_type(&p);
+        if(base_type->kind==TY_ENUM && p.enum_definition && !is_typedef &&
+           (ptok(&p)->kind==TK_EOF || type_start(&p) || reserved_enum_name(ptok(&p)->v))) continue;
 		if(paccept(&p, ";")) {
 			if(is_typedef || is_extern || is_static || is_inline)
 				perr(&p, "declaration specifier requires a declarator");
@@ -1306,6 +1603,9 @@ void parse_program(Tokens *token_stream, Program *prog)
 			if(q.function)
 				perr(&p, "function typedefs are not supported yet");
 			pexpect(&p, ";");
+            NameBinding *old=find_binding(&p,q.name);
+            if(old && old->is_enum_constant && old->depth==p.scope_depth)
+                perr(&p,"typedef '%s' conflicts with enum constant",q.name);
 			add_alias(&p, q.name, q.type);
 			continue;
 		}
@@ -1321,13 +1621,17 @@ void parse_program(Tokens *token_stream, Program *prog)
 		declaration->is_extern = is_extern;
 		declaration->is_static = is_static;
 		declaration->is_inline = is_inline;
+        bind_name(&p,q.name,q.type,false,0,q.function);
 		if(q.function) {
 			if(paccept(&p, ";"))
 				declaration->prototype = true;
 			else {
 				if(is_extern)
 					perr(&p, "extern function cannot have a body");
-				declaration->body = parse_block(&p);
+				p.pending_params=q.params; p.npending_params=q.nparams;
+                p.current_function=declaration;
+                declaration->body = parse_block(&p);
+                p.current_function=NULL;
 			}
 		} else {
 			if(paccept(&p, "=")) {
@@ -1335,7 +1639,13 @@ void parse_program(Tokens *token_stream, Program *prog)
 					perr(&p, "extern object cannot have an initializer");
 				declaration->init = parse_initializer(&p);
 			}
-			infer_array_bound(&p, declaration->type, declaration->init);
+			check_enum_conversion(&p,declaration->type,declaration->init);
+            if(declaration->type->kind==TY_ENUM && declaration->init) {
+                long value;
+                if(!eval_const_expr(declaration->init,&value))
+                    perr(&p,"global enum initializer must be an integer constant expression");
+            }
+            infer_array_bound(&p, declaration->type, declaration->init);
 			pexpect(&p, ";");
 		}
 		ARR_GROW(prog->a, prog->n, prog->cap, Decl *);

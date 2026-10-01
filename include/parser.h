@@ -12,6 +12,11 @@ typedef struct
 	Program *prog;
 	jmp_buf error_jmp;
 	int recovery_brace_depth;
+	int scope_depth;
+	Param *pending_params;
+	size_t npending_params;
+	bool enum_definition;
+	Decl *current_function;
 } Parser;
 
 void parse_program(Tokens *token_stream, Program *prog);

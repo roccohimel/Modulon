@@ -24,6 +24,8 @@ typedef struct
 {
 	char *name;
 	CType *type;
+    int depth;
+    bool active;
 } StructTag;
 
 typedef struct
@@ -38,6 +40,7 @@ typedef struct
 typedef enum
 {
 	EX_NUM,
+	EX_ENUM_CONST,
 	EX_STR,
 	EX_ID,
 	EX_UNARY,
@@ -138,6 +141,21 @@ struct Decl
 	Stmt *body;
 };
 
+typedef struct {
+    char *name;
+    CType *type;
+    long value;
+    int depth;
+    bool active, is_enum_constant, is_function;
+} NameBinding;
+
+typedef struct {
+    char *name;
+    CType *type;
+    int depth;
+    bool active;
+} EnumTag;
+
 typedef struct
 {
 	Decl **a;
@@ -146,6 +164,12 @@ typedef struct
 	size_t naliases, capaliases;
 	StructTag *tags;
 	size_t ntags, captags;
+	NameBinding *bindings;
+	size_t nbindings, capbindings;
+	EnumTag *enum_tags;
+	size_t nenum_tags, capenum_tags;
+	CType **enum_types;
+	size_t nenum_types, capenum_types;
 } Program;
 
 Expr *new_expr(ExprKind third_index);

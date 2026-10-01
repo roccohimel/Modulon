@@ -107,6 +107,7 @@ static long i386_type_size(CType *type)
 	case TY_SHORT:
 	case TY_U16:
 		return 2;
+	case TY_ENUM:
 	case TY_INT:
 	case TY_U32:
 	case TY_FLOAT:
@@ -398,6 +399,7 @@ static CType *i386_expr_type(I386Gen *gen, Expr *expression)
 		return &T_U32;
 	case EX_STR:
 		return ptr_to(&T_CHAR);
+	case EX_ENUM_CONST:
 	case EX_NUM:
 		return &T_U32;
 	case EX_UNARY:
@@ -1285,6 +1287,7 @@ static const char *i386_variable_format(CType *type)
 	case TY_BOOL:
 	case TY_CHAR:
 	case TY_SHORT:
+	case TY_ENUM:
 	case TY_INT:
 	case TY_U8:
 	case TY_U16:
@@ -1417,6 +1420,7 @@ static void i386_gen_expression(I386Gen *gen, Expr *expression)
 	CType *type;
 	uint32_t string_offset;
 	switch(expression->kind) {
+	case EX_ENUM_CONST:
 	case EX_NUM:
 		i386_emit_mov_eax_imm(gen, (uint32_t)expression->num);
 		if(i386_expression_is_u64(gen, expression)) {
